@@ -15,11 +15,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <stddef.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 
 typedef struct mDNSString {
-    void *bytes;
+    uint8_t *bytes;
     size_t length;
 } mDNSString;
 
@@ -31,13 +33,14 @@ typedef struct mDNSRecord {
 } mDNSRecord;
 
 
+static const char *sConfigPath = "/etc/mdnsarr";
 static uint16_t sPort = 5353;
 
 
-static int sStringsEqual(mDNSString aString, mDNSString bString)
+static bool sStringsEqual(mDNSString aString, mDNSString bString)
 {
     if (aString.length != bString.length) {
-        return 0;
+        return false;
     }
     
     uint8_t *a = aString.bytes;
@@ -49,14 +52,14 @@ static int sStringsEqual(mDNSString aString, mDNSString bString)
     while (a < aEnd) {
         if (labelCount > 0) {
             if (tolower(*a) != tolower(*b)) {
-                return 0;
+                return false;
             }
 
             labelCount--;
 
         } else {
             if (*a != *b) {
-                return 0;
+                return false;
             }
             
             labelCount = *a;
@@ -66,66 +69,79 @@ static int sStringsEqual(mDNSString aString, mDNSString bString)
         b++;
     }
 
-    return 1;
+    return true;
 }
 
 
-static int sSendBytes(int sock, const void *buffer, size_t size)
+static void sSendBytes(int sock, const void *buffer, size_t size)
 {
-	struct sockaddr_storage addr_storage;
+	struct sockaddr_storage storage;
 	struct sockaddr_in addr = {0};
 
-	struct sockaddr* saddr = (struct sockaddr*)&addr_storage;
+	struct sockaddr *saddr = (struct sockaddr *)&storage;
 	socklen_t saddrlen = sizeof(struct sockaddr_storage);
-	if (getsockname(sock, saddr, &saddrlen))
-		return -1;
+
+	if (getsockname(sock, saddr, &saddrlen) != 0) {
+        return;
+    }
 
     addr.sin_family = AF_INET;
     addr.sin_len = sizeof(addr);
     addr.sin_addr.s_addr = htonl((((uint32_t)224U) << 24U) | ((uint32_t)251U));
     addr.sin_port = htons((unsigned short)sPort);
-    saddr = (struct sockaddr*)&addr;
+    saddr = (struct sockaddr *)&addr;
     saddrlen = sizeof(addr);
 
-	if (sendto(sock, buffer, size, 0, saddr, saddrlen) < 0)
-		return -1;
-	return 0;
+	sendto(sock, buffer, size, 0, saddr, saddrlen);
 }
 
 
-static void sSendRecord(int sock, uint16_t queryID, mDNSRecord *record)
+static void sSendAnswers(int sock, uint16_t queryID, mDNSRecord **toAnswer, size_t toAnswerCount)
 {
-    void *output = alloca(1024);
+    size_t outputLength = 2048;
+    void *output = alloca(outputLength);
     __block void *o = output;
  
+    __auto_type ensure = ^(size_t length) {
+        return (o + length) < (output + outputLength);
+    };
+ 
     __auto_type writeInt16 = ^(uint16_t n) {
+        if (!ensure(2)) return;
         *(uint16_t *)o = htons(n);
         o += 2;
     };
 
     __auto_type writeBytes = ^(const void *bytes, size_t length) {
+        if (!ensure(length)) return;
         memcpy(o, bytes, length);
         o += length;
     };
 
     writeInt16(queryID);
-    writeInt16(0x8400);    // flags. QR=1, AA=1
-    writeInt16(0);         // question count
-    writeInt16(1);         // answer count
-    writeInt16(0);         // authority count
-    writeInt16(0);         // additional count
+    writeInt16(0x8400);        // flags. QR=1, AA=1
+    writeInt16(0);             // question count
+    writeInt16(toAnswerCount); // answer count
+    writeInt16(0);             // authority count
+    writeInt16(0);             // additional count
     
-    writeBytes(record->domain.bytes, record->domain.length);
-    
-	writeInt16(1);  // record type = A
-    writeInt16(1);  // record class = IN
-    writeInt16(0);  // TTL, top two bytes
-    writeInt16(60); // TTL = 60 seconds
-    writeInt16(4);  // RD length = 4
-    
-    writeBytes(&record->addr, 4);
+    for (size_t i = 0; i < toAnswerCount; i++) {
+        mDNSRecord *record = toAnswer[i];
 
-    sSendBytes(sock, output, o - output);
+        writeBytes(record->domain.bytes, record->domain.length);
+    
+        writeInt16(1);  // record type = A
+        writeInt16(1);  // record class = IN
+        writeInt16(0);  // TTL, top two bytes
+        writeInt16(60); // TTL = 60 seconds
+        writeInt16(4);  // RD length = 4
+    
+        writeBytes(&record->addr, 4);
+    }
+
+    if (ensure(0)) {
+        sSendBytes(sock, output, o - output);
+    }
 }
 
 
@@ -134,82 +150,145 @@ static void sHandleMessage(
     void *message, size_t messageLength,
     mDNSRecord *records
 ) {
+    __block bool invalid = false;
+
     __block void *m = message;
     
-    __auto_type readInt16 = ^{
-        uint16_t result = ntohs(*(uint16_t *)m);
-        m += 2;
+    __block mDNSString domain;
+    size_t domainCapacity = 512;
+    domain.bytes  = alloca(domainCapacity);
+    domain.length = 0;
+    
+    __auto_type writeDomainByte = ^(uint8_t c) {
+        if (domain.length < domainCapacity) {
+            domain.bytes[domain.length] = c;
+            domain.length++;
+        } else {
+            invalid = true;
+        }
+    };
+
+    __auto_type readByte = ^{
+        uint8_t result = 0;
+
+        if (m < (message + messageLength)) {
+            result = *(uint8_t *)m;
+            m += 1;
+        } else {
+            invalid = true;
+        }
+
         return result;
     };
 
-    if (messageLength < 13) return;
+    __auto_type readInt16 = ^{
+        return (readByte() << 8) | readByte();
+    };
+
+    __block void (^readDomain)(size_t) = ^(size_t recursionCount) {
+        while (1) {
+            uint8_t labelLength = readByte();
+            
+            // This is a reference
+            if ((labelLength & 0xc0) == 0xc0) {
+                uint16_t offset = ((labelLength & 0x3f) << 8) + readByte();
+
+                if (recursionCount < 8) {
+                    void *oldM = m;
+                    m = message + offset;
+                    readDomain(recursionCount + 1);
+                    m = oldM;
+
+                } else {
+                    invalid = true;
+                }
+
+                break;
+
+            } else if (labelLength > 0) {
+                writeDomainByte(labelLength);
+
+                for (uint8_t i = 0; i < labelLength; i++) {
+                    writeDomainByte(readByte());
+                }
+
+            } else {
+                writeDomainByte(0);
+                break;
+            }
+        }
+    };
+
+    __auto_type readQuestion = ^{
+        mDNSRecord *foundRecord = NULL;
+
+        domain.length = 0;
+        readDomain(0);
+        
+        uint16_t recordType  = readInt16();
+        uint16_t recordClass = readInt16();
+
+        // 1 = A record, 255 = Any
+        if ((recordType != 1) && (recordType != 255)) {
+            return foundRecord;
+        }
+        
+        // Remove mDNS flush bit
+        recordClass = recordClass & ~0x8000U;
+
+        // 1 = IN class, 255 = Any
+        if ((recordClass != 1) && (recordClass != 255)) {
+            return foundRecord;
+        }
+
+        mDNSRecord *currentRecord = records;
+
+        while (currentRecord) {
+            if (sStringsEqual(currentRecord->domain, domain)) {
+                foundRecord = currentRecord;
+                break;
+            }
+            
+            currentRecord = currentRecord->next;
+        }
+
+        return foundRecord;
+    };
 
 	uint16_t queryID         = readInt16();
     uint16_t flags           = readInt16();
 	uint16_t questionCount   = readInt16();
-    uint16_t answerCount     = readInt16();
-    uint16_t authorityCount  = readInt16();
-    uint16_t additionalCount = readInt16();
 
     // Check that QR=0 and Opcode=0
     if ((flags & 0xf800) != 0) {
         return;
     }
 
-    if (
-        questionCount   != 1 ||
-        answerCount     != 0 ||
-        authorityCount  != 0 ||
-        additionalCount != 0
-    ) {
-        return;
-    }
+    if (!questionCount) return;
+    
+    readInt16(); // answer count
+    readInt16(); // authority count
+    readInt16(); // additional count
 
-    //
-    mDNSString messageDomain = {0};
-    {
-        messageDomain.bytes = m;
+    mDNSRecord **toAnswer = alloca(questionCount * sizeof(mDNSRecord *));
+    memset(toAnswer, 0, questionCount * sizeof(mDNSRecord *));
+
+    size_t toAnswerCount = 0;
+    
+    for (size_t i = 0; i < questionCount; i++) {
+        mDNSRecord *record = readQuestion();
         
-        while (m < (message + messageLength)) {
-            messageDomain.length++;
-            if (*(uint8_t *)m++ == 0) break;
+        if (invalid) return;
+        
+        if (record) {
+            toAnswer[toAnswerCount] = record;
+            toAnswerCount++;
         }
     }
 
-    mDNSRecord *foundRecord = NULL;
-    mDNSRecord *currentRecord = records;
-
-    while (currentRecord) {
-        if (sStringsEqual(currentRecord->domain, messageDomain)) {
-            foundRecord = currentRecord;
-            break;
-        }
-        
-        currentRecord = currentRecord->next;
-    }
+    if (toAnswerCount == 0) return;
     
-    if (!foundRecord) return;
-    
-    size_t bytesRemaining = messageLength - (m - message);
-    if (bytesRemaining < 4) return;
-
-    uint16_t recordType  = readInt16();
-    uint16_t recordClass = readInt16();
-
-    // 1 = A record, 255 = Any
-    if ((recordType != 1) && (recordType != 255)) {
-        return;
-    }
-    
-    // Remove mDNS flush bit
-    recordClass = recordClass & ~0x8000U;
-
-    // 1 = IN class, 255 = Any
-    if ((recordClass != 1) && (recordClass != 255)) {
-        return;
-    }
-
-    sSendRecord(sock, queryID, foundRecord);
+    sSendAnswers(sock, queryID, toAnswer, toAnswerCount);
 }
 
 
@@ -261,7 +340,7 @@ fail:
 }
 
 
-static mDNSRecord *sParseConfigurationC(const char *path)
+static mDNSRecord *sParseConfiguration(const char *path)
 {
     __block mDNSRecord *result = NULL;
 
@@ -270,14 +349,14 @@ static mDNSRecord *sParseConfigurationC(const char *path)
     // Output: "<0x03>moo<0x04>oink<0x05>local"
     __auto_type parseDomain = ^(const char *input) {
         size_t outputLength = strlen(input) + 2;
-        char *output = malloc(outputLength);
+        uint8_t *output = malloc(outputLength);
 
         mDNSString result;
         result.bytes = output;
         result.length = outputLength;
 
         while (1) {
-            char *sizeByte = output;
+            uint8_t *sizeByte = output;
             output++;
             
             char currentByte = 0;
@@ -296,7 +375,7 @@ static mDNSRecord *sParseConfigurationC(const char *path)
             
             *sizeByte = currentSize;
             
-            if (currentByte == 0) break;
+            if (currentByte == 0 || currentSize == 0) break;
         }
         
         return result;
@@ -344,12 +423,12 @@ static mDNSRecord *sParseConfigurationC(const char *path)
 
 int main(int argc, const char* const* argv)
 {
-    mDNSRecord *records = sParseConfigurationC("/etc/mdnsarrr");
+    mDNSRecord *records = sParseConfiguration(sConfigPath);
         
     int socket = sMakeSocket();
 
 	if (!socket) {
-		printf("Failed to make socket\n");
+		fprintf(stderr, "Failed to make socket\n");
 		exit(1);
 	}
 
@@ -376,15 +455,10 @@ int main(int argc, const char* const* argv)
 
             FD_SET(socket, &fdset);
 		} else {
-			break;
+            exit(1);
 		}
 	}
 
-	free(inputBuffer);
-
-    if (socket) close(socket);
-
-    exit(0);
-
+    // Unreachable
 	return 0;
 }
